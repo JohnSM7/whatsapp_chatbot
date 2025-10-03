@@ -147,11 +147,12 @@ async function transcribeAudio(mediaId) {
 
 // --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (EL CEREBRO) ---
 async function procesarTextoConIA(texto, from) {
+    console.log("🧠 1. Iniciando procesamiento con IA...");
     const messages = [{ role: "user", content: texto }];
 
-    // 1. Primera llamada a OpenAI para que decida qué herramienta usar
+    // 1. Primera llamada a OpenAI
     const response = await openai.chat.completions.create({
-        model: "gpt-4o", // Usamos un modelo más potente para Tool Use
+        model: "gpt-4o",
         messages: messages,
         tools: tools,
         tool_choice: "auto",
@@ -161,12 +162,15 @@ async function procesarTextoConIA(texto, from) {
     const toolCalls = responseMessage.tool_calls;
 
     if (toolCalls) {
-        messages.push(responseMessage); // Añadir la respuesta de la IA a la conversación
-        // 2. Ejecutar las herramientas que la IA ha decidido usar
+        console.log("🧠 2. La IA ha decidido usar una herramienta.");
+        messages.push(responseMessage);
+        
         for (const toolCall of toolCalls) {
             const functionName = toolCall.function.name;
             const functionArgs = JSON.parse(toolCall.function.arguments);
             let functionResponse;
+
+            console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
 
             if (functionName === "get_calendar_events") {
                 functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
@@ -174,6 +178,8 @@ async function procesarTextoConIA(texto, from) {
                 functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
             }
             
+            console.log("🧠 4. Resultado de la herramienta:", functionResponse);
+
             messages.push({
                 tool_call_id: toolCall.id,
                 role: "tool",
@@ -182,17 +188,20 @@ async function procesarTextoConIA(texto, from) {
             });
         }
         
-        // 3. Segunda llamada a OpenAI con los resultados de las herramientas
+        console.log("🧠 5. Enviando resultado a OpenAI para obtener respuesta final...");
         const finalResponse = await openai.chat.completions.create({
             model: "gpt-4o",
             messages: messages,
         });
 
-        await enviarMensajeWhatsapp(finalResponse.choices[0].message.content, from);
+        const finalMessage = finalResponse.choices[0].message.content;
+        console.log("🧠 6. Respuesta final de la IA:", finalMessage);
+        await enviarMensajeWhatsapp(finalMessage, from);
 
     } else {
-        // 4. Si no se usó ninguna herramienta, es una conversación normal
-        await enviarMensajeWhatsapp(responseMessage.content, from);
+        const simpleMessage = responseMessage.content;
+        console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
+        await enviarMensajeWhatsapp(simpleMessage, from);
     }
 }
 
