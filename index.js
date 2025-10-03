@@ -150,7 +150,6 @@ async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const messages = [{ role: "user", content: texto }];
 
-    // 1. Primera llamada a OpenAI
     const response = await openai.chat.completions.create({
         model: "gpt-4o",
         messages: messages,
@@ -162,7 +161,7 @@ async function procesarTextoConIA(texto, from) {
     const toolCalls = responseMessage.tool_calls;
 
     if (toolCalls) {
-        console.log("🧠 2. La IA ha decidido usar una herramienta.");
+        console.log("🧠 2a. La IA ha decidido usar una herramienta."); // Cambiado a 2a para diferenciar
         messages.push(responseMessage);
         
         for (const toolCall of toolCalls) {
@@ -201,7 +200,10 @@ async function procesarTextoConIA(texto, from) {
     } else {
         const simpleMessage = responseMessage.content;
         console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
-        await enviarMensajeWhatsapp(simpleMessage, from);
+        
+        // --- LÍNEA CORREGIDA ---
+        // Aquí faltaba la llamada para enviar el mensaje de vuelta al usuario
+        await enviarMensajeWhatsapp(simpleMessage, from); 
     }
 }
 
