@@ -3,6 +3,9 @@ import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import OpenAI from "openai";
 import { google } from 'googleapis';
+import fs from 'fs';          // <--- Para manejar archivos
+import axios from 'axios';    // <--- Para descargar el audio
+import path from 'path';      // <--- Para manejar rutas de archivos
 
 const app = express();
 app.use(bodyParser.json());
@@ -26,125 +29,215 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 if (GOOGLE_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({
-    refresh_token: GOOGLE_REFRESH_TOKEN
-  });
+  oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
 }
-
 const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-// --- FUNCIÓN AUXILIAR PARA ENVIAR MENSAJES ---
-async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
-    // ... (sin cambios)
+// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI ---
+const tools = [
+  {
+    type: "function",
+    function: {
+      name: "get_calendar_events",
+      description: "Obtiene una lista de eventos del calendario de Google para un rango de fechas.",
+      parameters: {
+        type: "object",
+        properties: {
+          timeMin: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
+          timeMax: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
+        },
+        required: ["timeMin", "timeMax"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_calendar_event",
+      description: "Crea un nuevo evento en el calendario de Google.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "El título del evento." },
+          startDateTime: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
+          endDateTime: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
+        },
+        required: ["summary", "startDateTime", "endDateTime"],
+      },
+    },
+  },
+];
+
+// --- FUNCIONES DE HERRAMIENTAS (LAS MANOS) ---
+async function getCalendarEvents(timeMin, timeMax) {
+  try {
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin,
+      timeMax,
+      maxResults: 10,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+    return response.data.items;
+  } catch (error) {
+    console.error("Error al obtener eventos del calendario:", error);
+    return { error: "No se pudieron obtener los eventos." };
+  }
 }
 
-// --- ENDPOINTS ---
-app.get("/webhook", (req, res) => {
-    // ... (sin cambios)
-});
+async function createCalendarEvent(summary, startDateTime, endDateTime) {
+  try {
+    const response = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary,
+        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
+        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
+      },
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Error al crear el evento:", error);
+    return { error: "No se pudo crear el evento." };
+  }
+}
+
+// --- FUNCIÓN DE TRANSCRIPCIÓN DE AUDIO (LOS OÍDOS) ---
+async function transcribeAudio(mediaId) {
+    try {
+        // 1. Obtener la URL del archivo de audio
+        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, {
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        const mediaUrl = mediaUrlResponse.data.url;
+
+        // 2. Descargar el archivo de audio
+        const audioResponse = await axios({
+            url: mediaUrl,
+            method: 'GET',
+            responseType: 'stream',
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        
+        // 3. Guardar el audio en un archivo temporal
+        const tempPath = path.join('/tmp', `${mediaId}.ogg`); // Railway permite escribir en /tmp
+        const writer = fs.createWriteStream(tempPath);
+        audioResponse.data.pipe(writer);
+        await new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+
+        // 4. Enviar a Whisper para transcribir
+        const transcription = await openai.audio.transcriptions.create({
+            file: fs.createReadStream(tempPath),
+            model: "whisper-1",
+        });
+
+        // 5. Borrar el archivo temporal
+        fs.unlinkSync(tempPath);
+
+        return transcription.text;
+    } catch (error) {
+        console.error("Error al transcribir el audio:", error.response ? error.response.data : error.message);
+        return { error: "No se pudo procesar el audio." };
+    }
+}
+
+// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (EL CEREBRO) ---
+async function procesarTextoConIA(texto, from) {
+    const messages = [{ role: "user", content: texto }];
+
+    // 1. Primera llamada a OpenAI para que decida qué herramienta usar
+    const response = await openai.chat.completions.create({
+        model: "gpt-4o", // Usamos un modelo más potente para Tool Use
+        messages: messages,
+        tools: tools,
+        tool_choice: "auto",
+    });
+    
+    const responseMessage = response.choices[0].message;
+    const toolCalls = responseMessage.tool_calls;
+
+    if (toolCalls) {
+        messages.push(responseMessage); // Añadir la respuesta de la IA a la conversación
+        // 2. Ejecutar las herramientas que la IA ha decidido usar
+        for (const toolCall of toolCalls) {
+            const functionName = toolCall.function.name;
+            const functionArgs = JSON.parse(toolCall.function.arguments);
+            let functionResponse;
+
+            if (functionName === "get_calendar_events") {
+                functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
+            } else if (functionName === "create_calendar_event") {
+                functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
+            }
+            
+            messages.push({
+                tool_call_id: toolCall.id,
+                role: "tool",
+                name: functionName,
+                content: JSON.stringify(functionResponse),
+            });
+        }
+        
+        // 3. Segunda llamada a OpenAI con los resultados de las herramientas
+        const finalResponse = await openai.chat.completions.create({
+            model: "gpt-4o",
+            messages: messages,
+        });
+
+        await enviarMensajeWhatsapp(finalResponse.choices[0].message.content, from);
+
+    } else {
+        // 4. Si no se usó ninguna herramienta, es una conversación normal
+        await enviarMensajeWhatsapp(responseMessage.content, from);
+    }
+}
+
+// --- ENDPOINTS Y SERVIDOR ---
+app.get("/webhook", (req, res) => { /* ... tu código de verificación ... */ });
 
 app.post("/webhook", async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!entry) return res.sendStatus(200);
 
-    if (entry && entry.text) {
-        const from = entry.from;
-        const text = entry.text.body;
-        console.log("Mensaje recibido:", text);
+    const from = entry.from;
+    let userText;
 
-        // --- MANEJO DE COMANDOS ---
-        if (text.toLowerCase() === "/conectar_google") {
-            // ... (sin cambios)
-        } else if (text.toLowerCase() === "/ver_agenda") {
-            if (!GOOGLE_REFRESH_TOKEN) {
-                await enviarMensajeWhatsapp("Necesitas conectar tu cuenta de Google primero. Envía '/conectar_google'.", from);
-                return res.sendStatus(200);
-            }
-            try {
-                // --- INICIO DE LA NUEVA LÓGICA ---
+    if (entry.text) {
+        // Mensaje de texto
+        userText = entry.text.body;
+        console.log("Mensaje de texto recibido:", userText);
+    } else if (entry.audio) {
+        // Mensaje de audio
+        console.log("Mensaje de audio recibido. Transcribiendo...");
+        userText = await transcribeAudio(entry.audio.id);
+        if (userText.error) {
+            await enviarMensajeWhatsapp("Lo siento, no pude entender tu audio.", from);
+            return res.sendStatus(200);
+        }
+        await enviarMensajeWhatsapp(`He entendido: "${userText}"`, from);
+    }
 
-                // 1. Obtener la lista de todos los calendarios del usuario
-                const calendarList = await calendar.calendarList.list();
-                const calendars = calendarList.data.items;
-
-                // 2. Preparar una petición para cada calendario
-                const eventPromises = calendars.map(cal => {
-                    return calendar.events.list({
-                        calendarId: cal.id,
-                        timeMin: (new Date()).toISOString(),
-                        maxResults: 5,
-                        singleEvents: true,
-                        orderBy: 'startTime',
-                    });
-                });
-
-                // 3. Ejecutar todas las peticiones en paralelo
-                const allEventResponses = await Promise.all(eventPromises);
-
-                // 4. Juntar todos los eventos en una sola lista
-                let allEvents = [];
-                allEventResponses.forEach(response => {
-                    if (response.data.items) {
-                        allEvents = allEvents.concat(response.data.items);
-                    }
-                });
-
-                // 5. Ordenar todos los eventos por fecha de inicio
-                allEvents.sort((a, b) => new Date(a.start.dateTime || a.start.date) - new Date(b.start.dateTime || b.start.date));
-
-                // 6. Tomar los próximos 5 eventos de la lista combinada
-                const upcomingEvents = allEvents.slice(0, 5);
-
-                // --- FIN DE LA NUEVA LÓGICA ---
-
-                if (!upcomingEvents || upcomingEvents.length === 0) {
-                    await enviarMensajeWhatsapp("¡No tienes próximos eventos en ninguno de tus calendarios!", from);
-                } else {
-                    let respuesta = "Tus próximos 5 eventos en todos tus calendarios son:\n\n";
-                    upcomingEvents.forEach(event => {
-                        const start = new Date(event.start.dateTime || event.start.date);
-                        const fechaFormateada = start.toLocaleString('es-ES', { dateStyle: 'medium', timeStyle: 'short' });
-                        respuesta += `🗓️ ${event.summary} - ${fechaFormateada}\n`;
-                    });
-                    await enviarMensajeWhatsapp(respuesta, from);
-                }
-            } catch (error) {
-                console.error("Error al consultar Google Calendar:", error);
-                await enviarMensajeWhatsapp("Lo siento, no pude consultar tu agenda.", from);
-            }
-        } else {
-            // Lógica de OpenAI... (sin cambios)
+    if (userText) {
+        try {
+            await procesarTextoConIA(userText, from);
+        } catch (error) {
+            console.error("Error en el procesamiento de IA:", error);
+            await enviarMensajeWhatsapp("Uups, algo salió mal en mi cerebro. Inténtalo de nuevo.", from);
         }
     }
+    
     res.sendStatus(200);
 });
 
-app.get('/oauth2callback', async (req, res) => {
-    // ... (sin cambios)
-});
+app.get('/oauth2callback', async (req, res) => { /* ... tu código de callback ... */ });
 
-// --- INICIAR SERVIDOR ---
+// Iniciar servidor...
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en el puerto ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`Servidor escuchando en el puerto ${PORT}`); });
 
-// --- FUNCIÓN AUXILIAR REUTILIZADA ---
-async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
-  try {
-    await fetch(`https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-      },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to: numeroDestinatario,
-        text: { body: texto },
-      }),
-    });
-    console.log(`Respuesta enviada a ${numeroDestinatario}.`);
-  } catch (error) {
-    console.error("Error al enviar mensaje a WhatsApp:", error);
-  }
-}
+async function enviarMensajeWhatsapp(texto, numero) { /* ... tu función de envío ... */ }
+// Rellena el código que falta de los bloques anteriores si es necesario
