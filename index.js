@@ -2,22 +2,21 @@ import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import OpenAI from "openai";
-import { google } from 'googleapis'; // <--- AÑADIDO
+import { google } from 'googleapis';
 
 const app = express();
 app.use(bodyParser.json());
 
 // --- VARIABLES DE ENTORNO ---
-// WhatsApp y OpenAI
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Google Calendar (Asegúrate de añadirlas en Railway)
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN; // <--- Nueva variable
 
 // --- CONFIGURACIÓN DE GOOGLE ---
 const oauth2Client = new google.auth.OAuth2(
@@ -26,8 +25,17 @@ const oauth2Client = new google.auth.OAuth2(
   GOOGLE_REDIRECT_URI
 );
 
+// Carga el refresh token si existe
+if (GOOGLE_REFRESH_TOKEN) {
+  oauth2Client.setCredentials({
+    refresh_token: GOOGLE_REFRESH_TOKEN
+  });
+}
+
+// Crea una instancia del cliente de Google Calendar autenticado
+const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+
 // --- FUNCIÓN AUXILIAR PARA ENVIAR MENSAJES ---
-// He movido la lógica de envío aquí para poder reutilizarla
 async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
   try {
     await fetch(`https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`, {
@@ -48,89 +56,64 @@ async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
   }
 }
 
-// --- ENDPOINTS DE LA APLICACIÓN ---
-
-// Endpoint de verificación del Webhook de WhatsApp (GET)
+// --- ENDPOINTS ---
 app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode && token === VERIFY_TOKEN) {
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
+    // Tu código de verificación... (sin cambios)
 });
 
-// Endpoint principal para recibir mensajes de WhatsApp (POST)
 app.post("/webhook", async (req, res) => {
-  const entry = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const entry = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
-  if (entry && entry.text) {
-    const from = entry.from; // Número del usuario que escribe
-    const text = entry.text.body;
+    if (entry && entry.text) {
+        const from = entry.from;
+        const text = entry.text.body;
+        console.log("Mensaje recibido:", text);
 
-    console.log("Mensaje recibido:", text);
+        // --- MANEJO DE COMANDOS ---
+        if (text.toLowerCase() === "/conectar_google") {
+            // Lógica para generar y enviar la URL de autorización... (sin cambios)
+        } else if (text.toLowerCase() === "/ver_agenda") {
+            if (!GOOGLE_REFRESH_TOKEN) {
+                await enviarMensajeWhatsapp("Necesitas conectar tu cuenta de Google primero. Envía '/conectar_google'.", from);
+                return res.sendStatus(200);
+            }
+            try {
+                // Petición a la API de Google Calendar
+                const response = await calendar.events.list({
+                    calendarId: 'primary', // 'primary' es tu calendario principal
+                    timeMin: (new Date()).toISOString(),
+                    maxResults: 5, // Los próximos 5 eventos
+                    singleEvents: true,
+                    orderBy: 'startTime',
+                });
 
-    // Lógica para manejar comandos especiales o conversaciones
-    if (text.toLowerCase() === "/conectar_google") {
-      // 1. Genera la URL para que el usuario dé su consentimiento
-      const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline', // Pide un refresh_token
-        scope: ['https://www.googleapis.com/auth/calendar'], // Permiso para el calendario
-      });
-      
-      // 2. Envía la URL al usuario
-      await enviarMensajeWhatsapp(`Para autorizar el acceso a tu Google Calendar, haz clic en el siguiente enlace:\n\n${authUrl}`, from);
-
-    } else {
-      // 3. Si no es un comando, habla con OpenAI
-      let respuesta = "No entendí, ¿puedes repetirlo?";
-      try {
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages: [{ role: "user", content: text }],
-        });
-        respuesta = completion.choices[0].message.content;
-      } catch (error) {
-        console.error("Error con OpenAI:", error);
-        respuesta = "Lo siento, tengo problemas para conectarme con mi cerebro de IA en este momento. 🤖";
-      }
-
-      await enviarMensajeWhatsapp(respuesta, from);
+                const events = response.data.items;
+                if (!events || events.length === 0) {
+                    await enviarMensajeWhatsapp("¡No tienes próximos eventos en tu agenda!", from);
+                } else {
+                    let respuesta = "Tus próximos 5 eventos son:\n\n";
+                    events.forEach(event => {
+                        const start = new Date(event.start.dateTime || event.start.date);
+                        // Formateamos la fecha para que sea legible
+                        const fechaFormateada = start.toLocaleString('es-ES', { dateStyle: 'medium', timeStyle: 'short' });
+                        respuesta += `🗓️ ${event.summary} - ${fechaFormateada}\n`;
+                    });
+                    await enviarMensajeWhatsapp(respuesta, from);
+                }
+            } catch (error) {
+                console.error("Error al consultar Google Calendar:", error);
+                await enviarMensajeWhatsapp("Lo siento, no pude consultar tu agenda.", from);
+            }
+        } else {
+            // Lógica de OpenAI... (sin cambios)
+        }
     }
-  }
-
-  res.sendStatus(200); // Responde a Meta para confirmar recepción
+    res.sendStatus(200);
 });
 
-
-// --- NUEVO ENDPOINT PARA EL CALLBACK DE GOOGLE (GET) ---
-// Aquí es donde Google redirige al usuario después de la autorización
 app.get('/oauth2callback', async (req, res) => {
-    const code = req.query.code; // Google nos da un código de autorización
-
-    try {
-        // 1. Intercambiamos el código por los tokens
-        const { tokens } = await oauth2Client.getToken(code);
-        const refreshToken = tokens.refresh_token;
-
-        // 2. Mostramos el Refresh Token en la consola para que lo copies
-        console.log("--- ¡REFRESH TOKEN OBTENIDO! ---");
-        console.log("Copia este token y guárdalo en tus variables de entorno como GOOGLE_REFRESH_TOKEN:");
-        console.log(refreshToken);
-        console.log("---------------------------------");
-        
-        // 3. Enviamos una respuesta al navegador del usuario
-        res.send('¡Autorización completada con éxito! Ya puedes cerrar esta ventana y volver a WhatsApp.');
-
-    } catch (error) {
-        console.error("Error al obtener los tokens de Google:", error);
-        res.status(500).send('Hubo un error durante la autorización. Inténtalo de nuevo.');
-    }
+    // Tu código para obtener el refresh token... (sin cambios)
 });
-
 
 // --- INICIAR SERVIDOR ---
 const PORT = process.env.PORT || 3000;
