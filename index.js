@@ -148,11 +148,28 @@ async function transcribeAudio(mediaId) {
 // --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (EL CEREBRO) ---
 async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
-    const messages = [{ role: "user", content: texto }];
+    
+    // --- INICIO DE LA CORRECCIÓN ---
+    // Obtenemos la fecha actual en formato ISO para dársela a la IA
+    const currentDate = new Date().toISOString();
+    
+    // Creamos una lista de mensajes que incluye el contexto de la fecha actual
+    const messages = [
+        { 
+            role: "system", 
+            content: `Eres un asistente de WhatsApp. La fecha y hora actual es ${currentDate}. Usa esta información para interpretar las peticiones de fechas del usuario (como "hoy", "mañana", "el próximo lunes").`
+        },
+        { 
+            role: "user", 
+            content: texto 
+        }
+    ];
+    // --- FIN DE LA CORRECCIÓN ---
 
+    // 1. Primera llamada a OpenAI
     const response = await openai.chat.completions.create({
         model: "gpt-4o",
-        messages: messages,
+        messages: messages, // Usamos la nueva lista de mensajes con el contexto
         tools: tools,
         tool_choice: "auto",
     });
@@ -161,7 +178,7 @@ async function procesarTextoConIA(texto, from) {
     const toolCalls = responseMessage.tool_calls;
 
     if (toolCalls) {
-        console.log("🧠 2a. La IA ha decidido usar una herramienta."); // Cambiado a 2a para diferenciar
+        console.log("🧠 2a. La IA ha decidido usar una herramienta.");
         messages.push(responseMessage);
         
         for (const toolCall of toolCalls) {
@@ -200,10 +217,7 @@ async function procesarTextoConIA(texto, from) {
     } else {
         const simpleMessage = responseMessage.content;
         console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
-        
-        // --- LÍNEA CORREGIDA ---
-        // Aquí faltaba la llamada para enviar el mensaje de vuelta al usuario
-        await enviarMensajeWhatsapp(simpleMessage, from); 
+        await enviarMensajeWhatsapp(simpleMessage, from);
     }
 }
 
