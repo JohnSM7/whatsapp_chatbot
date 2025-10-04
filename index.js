@@ -10,7 +10,7 @@ import path from 'path';
 const app = express();
 app.use(bodyParser.json());
 
-// --- VARIABLES DE ENTORNO (sin cambios) ---
+// --- VARIABLES DE ENTORNO ---
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
@@ -21,18 +21,19 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
-// --- CONFIGURACIÓN DE GOOGLE (sin cambios) ---
+// --- CONFIGURACIÓN DE GOOGLE ---
 const oauth2Client = new google.auth.OAuth2(
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
   GOOGLE_REDIRECT_URI
 );
+
 if (GOOGLE_REFRESH_TOKEN) {
   oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
 }
 const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-// --- DEFINICIÓN DE HERRAMIENTAS (sin cambios, pero he rellenado los parámetros que faltaban) ---
+// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI ---
 const tools = [
   {
     type: "function",
@@ -83,12 +84,11 @@ const tools = [
   },
 ];
 
-// --- FUNCIONES DE HERRAMIENTAS (CON CORRECCIÓN) ---
+// --- FUNCIONES DE HERRAMIENTAS (LAS MANOS) ---
 async function getCalendarEvents(timeMin, timeMax) {
-  // --- CORRECCIÓN 1: Manejar argumentos vacíos ---
   if (!timeMin || !timeMax) {
       console.error("Error: La herramienta get_calendar_events fue llamada sin fechas.");
-      return []; // Devolver una lista vacía para evitar el crash
+      return [];
   }
   try {
     const calendarList = await calendar.calendarList.list();
@@ -111,11 +111,60 @@ async function getCalendarEvents(timeMin, timeMax) {
   }
 }
 
-async function createCalendarEvent(summary, startDateTime, endDateTime) { /* ... (sin cambios) ... */ }
-async function updateCalendarEvent(eventId, startDateTime, endDateTime) { /* ... (sin cambios) ... */ }
-async function transcribeAudio(mediaId) { /* ... (sin cambios) ... */ }
+async function createCalendarEvent(summary, startDateTime, endDateTime) {
+  try {
+    const response = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary,
+        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
+        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
+      },
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Error al crear el evento:", error);
+    return { error: "No se pudo crear el evento." };
+  }
+}
 
-// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (CON CORRECCIÓN) ---
+async function updateCalendarEvent(eventId, startDateTime, endDateTime) {
+  try {
+    const response = await calendar.events.patch({
+      calendarId: 'primary',
+      eventId: eventId,
+      requestBody: {
+        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
+        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
+      },
+    });
+    return response.data;
+  } catch (error) {
+    console.error(`Error al actualizar el evento ${eventId}:`, error);
+    return { error: "No se pudo actualizar el evento." };
+  }
+}
+
+// --- FUNCIÓN DE TRANSCRIPCIÓN DE AUDIO (LOS OÍDOS) ---
+async function transcribeAudio(mediaId) {
+    try {
+        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
+        const mediaUrl = mediaUrlResponse.data.url;
+        const audioResponse = await axios({ url: mediaUrl, method: 'GET', responseType: 'stream', headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
+        const tempPath = path.join('/tmp', `${mediaId}.ogg`);
+        const writer = fs.createWriteStream(tempPath);
+        audioResponse.data.pipe(writer);
+        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+        const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(tempPath), model: "whisper-1" });
+        fs.unlinkSync(tempPath);
+        return transcription.text;
+    } catch (error) {
+        console.error("Error al transcribir el audio:", error.response ? error.response.data : error.message);
+        return { error: "No se pudo procesar el audio." };
+    }
+}
+
+// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (EL CEREBRO) ---
 async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const currentDate = new Date().toISOString();
@@ -152,14 +201,12 @@ async function procesarTextoConIA(texto, from) {
             
             console.log("🧠 4. Resultado de la herramienta:", functionResponse);
 
-            // --- CORRECCIÓN 2: Asegurarse de que el contenido siempre sea un string ---
             const contentString = JSON.stringify(functionResponse) || '{"status": "La herramienta no devolvió resultado"}';
-
             messages.push({
                 tool_call_id: toolCall.id,
                 role: "tool",
                 name: functionName,
-                content: contentString, // Usar siempre el string seguro
+                content: contentString,
             });
         }
         
@@ -177,61 +224,7 @@ async function procesarTextoConIA(texto, from) {
     }
 }
 
-
-// --- RESTO DEL CÓDIGO (SIN CAMBIOS) ---
-// Rellena estas funciones con el código de los mensajes anteriores.
-async function createCalendarEvent(summary, startDateTime, endDateTime) {
-  try {
-    const response = await calendar.events.insert({
-      calendarId: 'primary',
-      requestBody: {
-        summary,
-        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
-        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
-      },
-    });
-    return response.data;
-  } catch (error) {
-    console.error("Error al crear el evento:", error);
-    return { error: "No se pudo crear el evento." };
-  }
-}
-
-async function updateCalendarEvent(eventId, startDateTime, endDateTime) {
-  try {
-    const response = await calendar.events.patch({
-      calendarId: 'primary',
-      eventId: eventId,
-      requestBody: {
-        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
-        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
-      },
-    });
-    return response.data;
-  } catch (error) {
-    console.error(`Error al actualizar el evento ${eventId}:`, error);
-    return { error: "No se pudo actualizar el evento." };
-  }
-}
-
-async function transcribeAudio(mediaId) {
-    try {
-        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
-        const mediaUrl = mediaUrlResponse.data.url;
-        const audioResponse = await axios({ url: mediaUrl, method: 'GET', responseType: 'stream', headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
-        const tempPath = path.join('/tmp', `${mediaId}.ogg`);
-        const writer = fs.createWriteStream(tempPath);
-        audioResponse.data.pipe(writer);
-        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-        const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(tempPath), model: "whisper-1" });
-        fs.unlinkSync(tempPath);
-        return transcription.text;
-    } catch (error) {
-        console.error("Error al transcribir el audio:", error.response ? error.response.data : error.message);
-        return { error: "No se pudo procesar el audio." };
-    }
-}
-
+// --- FUNCIÓN AUXILIAR PARA ENVIAR MENSAJES ---
 async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
     console.log(`🚀 Intentando enviar mensaje a ${numeroDestinatario}...`);
     try {
@@ -247,6 +240,7 @@ async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
     }
 }
 
+// --- ENDPOINTS Y SERVIDOR ---
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
@@ -298,4 +292,6 @@ app.get('/oauth2callback', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`Servidor escuchando en el puerto ${PORT}`); });
+app.listen(PORT, () => {
+  console.log(`Servidor escuchando en el puerto ${PORT}`);
+});
