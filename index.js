@@ -27,22 +27,26 @@ const oauth2Client = new google.auth.OAuth2(
   GOOGLE_CLIENT_SECRET,
   GOOGLE_REDIRECT_URI
 );
-
 if (GOOGLE_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({
-    refresh_token: GOOGLE_REFRESH_TOKEN
-  });
+  oauth2Client.setCredentials({ refresh_token: GOOGLE_REFRESH_TOKEN });
 }
 const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI (CON CAMBIOS) ---
+// --- DEFINICIÓN DE HERRAMIENTAS (sin cambios, pero he rellenado los parámetros que faltaban) ---
 const tools = [
   {
     type: "function",
     function: {
       name: "get_calendar_events",
       description: "Obtiene una lista de eventos del calendario de Google para un rango de fechas. Es útil para encontrar eventos antes de modificarlos.",
-      parameters: { /* ... (sin cambios) ... */ },
+      parameters: {
+        type: "object",
+        properties: {
+          timeMin: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
+          timeMax: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
+        },
+        required: ["timeMin", "timeMax"],
+      },
     },
   },
   {
@@ -50,10 +54,17 @@ const tools = [
     function: {
       name: "create_calendar_event",
       description: "Crea un nuevo evento en el calendario de Google.",
-      parameters: { /* ... (sin cambios) ... */ },
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "El título del evento." },
+          startDateTime: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
+          endDateTime: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
+        },
+        required: ["summary", "startDateTime", "endDateTime"],
+      },
     },
   },
-  // --- NUEVA HERRAMIENTA AÑADIDA ---
   {
     type: "function",
     function: {
@@ -72,12 +83,120 @@ const tools = [
   },
 ];
 
+// --- FUNCIONES DE HERRAMIENTAS (CON CORRECCIÓN) ---
+async function getCalendarEvents(timeMin, timeMax) {
+  // --- CORRECCIÓN 1: Manejar argumentos vacíos ---
+  if (!timeMin || !timeMax) {
+      console.error("Error: La herramienta get_calendar_events fue llamada sin fechas.");
+      return []; // Devolver una lista vacía para evitar el crash
+  }
+  try {
+    const calendarList = await calendar.calendarList.list();
+    const calendars = calendarList.data.items;
+    const eventPromises = calendars.map(cal => {
+        return calendar.events.list({
+            calendarId: cal.id, timeMin, timeMax, maxResults: 50, singleEvents: true, orderBy: 'startTime',
+        });
+    });
+    const allEventResponses = await Promise.all(eventPromises);
+    let allEvents = [];
+    allEventResponses.forEach(response => {
+        if (response.data.items) { allEvents = allEvents.concat(response.data.items); }
+    });
+    allEvents.sort((a, b) => new Date(a.start.dateTime || a.start.date) - new Date(b.start.dateTime || b.start.date));
+    return allEvents.slice(0, 25);
+  } catch (error) {
+    console.error("Error al obtener eventos del calendario:", error);
+    return { error: "No se pudieron obtener los eventos." };
+  }
+}
 
-// --- FUNCIONES DE HERRAMIENTAS (CON CAMBIOS) ---
-async function getCalendarEvents(timeMin, timeMax) { /* ... (sin cambios) ... */ }
 async function createCalendarEvent(summary, startDateTime, endDateTime) { /* ... (sin cambios) ... */ }
+async function updateCalendarEvent(eventId, startDateTime, endDateTime) { /* ... (sin cambios) ... */ }
+async function transcribeAudio(mediaId) { /* ... (sin cambios) ... */ }
 
-// --- NUEVA FUNCIÓN AÑADIDA ---
+// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (CON CORRECCIÓN) ---
+async function procesarTextoConIA(texto, from) {
+    console.log("🧠 1. Iniciando procesamiento con IA...");
+    const currentDate = new Date().toISOString();
+    const messages = [
+        { role: "system", content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Resume la información y formatea tu respuesta de manera clara y amigable.` },
+        { role: "user", content: texto }
+    ];
+
+    const response = await openai.chat.completions.create({
+        model: "gpt-4o", messages: messages, tools: tools, tool_choice: "auto",
+    });
+    
+    const responseMessage = response.choices[0].message;
+    const toolCalls = responseMessage.tool_calls;
+
+    if (toolCalls) {
+        console.log("🧠 2a. La IA ha decidido usar una herramienta.");
+        messages.push(responseMessage);
+        
+        for (const toolCall of toolCalls) {
+            const functionName = toolCall.function.name;
+            const functionArgs = JSON.parse(toolCall.function.arguments);
+            let functionResponse;
+
+            console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
+
+            if (functionName === "get_calendar_events") {
+                functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
+            } else if (functionName === "create_calendar_event") {
+                functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
+            } else if (functionName === "update_calendar_event") {
+                functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime);
+            }
+            
+            console.log("🧠 4. Resultado de la herramienta:", functionResponse);
+
+            // --- CORRECCIÓN 2: Asegurarse de que el contenido siempre sea un string ---
+            const contentString = JSON.stringify(functionResponse) || '{"status": "La herramienta no devolvió resultado"}';
+
+            messages.push({
+                tool_call_id: toolCall.id,
+                role: "tool",
+                name: functionName,
+                content: contentString, // Usar siempre el string seguro
+            });
+        }
+        
+        console.log("🧠 5. Enviando resultado a OpenAI para obtener respuesta final...");
+        const finalResponse = await openai.chat.completions.create({
+            model: "gpt-4o", messages: messages,
+        });
+        const finalMessage = finalResponse.choices[0].message.content;
+        console.log("🧠 6. Respuesta final de la IA:", finalMessage);
+        await enviarMensajeWhatsapp(finalMessage, from);
+    } else {
+        const simpleMessage = responseMessage.content;
+        console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
+        await enviarMensajeWhatsapp(simpleMessage, from);
+    }
+}
+
+
+// --- RESTO DEL CÓDIGO (SIN CAMBIOS) ---
+// Rellena estas funciones con el código de los mensajes anteriores.
+async function createCalendarEvent(summary, startDateTime, endDateTime) {
+  try {
+    const response = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: {
+        summary,
+        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
+        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
+      },
+    });
+    return response.data;
+  } catch (error) {
+    console.error("Error al crear el evento:", error);
+    return { error: "No se pudo crear el evento." };
+  }
+}
+
 async function updateCalendarEvent(eventId, startDateTime, endDateTime) {
   try {
     const response = await calendar.events.patch({
@@ -95,94 +214,31 @@ async function updateCalendarEvent(eventId, startDateTime, endDateTime) {
   }
 }
 
-// --- FUNCIÓN DE TRANSCRIPCIÓN DE AUDIO (sin cambios) ---
-async function transcribeAudio(mediaId) { /* ... (sin cambios) ... */ }
-
-// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (CON CAMBIOS) ---
-async function procesarTextoConIA(texto, from) {
-    console.log("🧠 1. Iniciando procesamiento con IA...");
-    const currentDate = new Date().toISOString();
-    
-    const messages = [
-        { 
-            role: "system", 
-            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Resume la información y formatea tu respuesta de manera clara y amigable.`
-        },
-        { role: "user", content: texto }
-    ];
-
-    const response = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: messages,
-        tools: tools,
-        tool_choice: "auto",
-    });
-    
-    const responseMessage = response.choices[0].message;
-    const toolCalls = responseMessage.tool_calls;
-
-    if (toolCalls) {
-        console.log("🧠 2a. La IA ha decidido usar una herramienta.");
-        messages.push(responseMessage);
-        
-        for (const toolCall of toolCalls) {
-            const functionName = toolCall.function.name;
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-            let functionResponse;
-
-            console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
-
-            // --- LÓGICA DE HERRAMIENTAS ACTUALIZADA ---
-            if (functionName === "get_calendar_events") {
-                functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
-            } else if (functionName === "create_calendar_event") {
-                functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
-            } else if (functionName === "update_calendar_event") {
-                functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime);
-            }
-            
-            console.log("🧠 4. Resultado de la herramienta:", functionResponse);
-
-            messages.push({
-                tool_call_id: toolCall.id,
-                role: "tool",
-                name: functionName,
-                content: JSON.stringify(functionResponse),
-            });
-        }
-        
-        console.log("🧠 5. Enviando resultado a OpenAI para obtener respuesta final...");
-        const finalResponse = await openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: messages,
-        });
-
-        const finalMessage = finalResponse.choices[0].message.content;
-        console.log("🧠 6. Respuesta final de la IA:", finalMessage);
-        await enviarMensajeWhatsapp(finalMessage, from);
-
-    } else {
-        const simpleMessage = responseMessage.content;
-        console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
-        await enviarMensajeWhatsapp(simpleMessage, from);
+async function transcribeAudio(mediaId) {
+    try {
+        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
+        const mediaUrl = mediaUrlResponse.data.url;
+        const audioResponse = await axios({ url: mediaUrl, method: 'GET', responseType: 'stream', headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
+        const tempPath = path.join('/tmp', `${mediaId}.ogg`);
+        const writer = fs.createWriteStream(tempPath);
+        audioResponse.data.pipe(writer);
+        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+        const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(tempPath), model: "whisper-1" });
+        fs.unlinkSync(tempPath);
+        return transcription.text;
+    } catch (error) {
+        console.error("Error al transcribir el audio:", error.response ? error.response.data : error.message);
+        return { error: "No se pudo procesar el audio." };
     }
 }
 
-// --- FUNCIÓN AUXILIAR PARA ENVIAR MENSAJES ---
 async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
     console.log(`🚀 Intentando enviar mensaje a ${numeroDestinatario}...`);
     try {
         const response = await fetch(`https://graph.facebook.com/v19.0/${PHONE_NUMBER_ID}/messages`, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-            },
-            body: JSON.stringify({
-                messaging_product: "whatsapp",
-                to: numeroDestinatario,
-                text: { body: texto },
-            }),
+            headers: { "Content-Type": "application/json", "Authorization": `Bearer ${WHATSAPP_TOKEN}` },
+            body: JSON.stringify({ messaging_product: "whatsapp", to: numeroDestinatario, text: { body: texto } }),
         });
         const responseData = await response.json();
         console.log("✅ Respuesta de la API de Meta:", JSON.stringify(responseData, null, 2));
@@ -191,26 +247,18 @@ async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
     }
 }
 
-// --- ENDPOINTS Y SERVIDOR ---
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
-
-    if (mode && token === VERIFY_TOKEN) {
-        res.status(200).send(challenge);
-    } else {
-        res.sendStatus(403);
-    }
+    if (mode && token === VERIFY_TOKEN) { res.status(200).send(challenge); } else { res.sendStatus(403); }
 });
 
 app.post("/webhook", async (req, res) => {
     const entry = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!entry) return res.sendStatus(200);
-
     const from = entry.from;
     let userText;
-
     try {
         if (entry.text) {
             userText = entry.text.body;
@@ -225,15 +273,11 @@ app.post("/webhook", async (req, res) => {
             userText = transcriptionResult;
             await enviarMensajeWhatsapp(`He entendido: "${userText}"`, from);
         }
-
-        if (userText) {
-            await procesarTextoConIA(userText, from);
-        }
+        if (userText) { await procesarTextoConIA(userText, from); }
     } catch (error) {
         console.error("Error fatal en el webhook:", error);
         await enviarMensajeWhatsapp("Uups, algo salió muy mal. Por favor, inténtalo de nuevo.", from);
     }
-    
     res.sendStatus(200);
 });
 
@@ -242,12 +286,10 @@ app.get('/oauth2callback', async (req, res) => {
     try {
         const { tokens } = await oauth2Client.getToken(code);
         const refreshToken = tokens.refresh_token;
-
         console.log("--- ¡REFRESH TOKEN OBTENIDO! ---");
         console.log("Copia este token y guárdalo en tus variables de entorno como GOOGLE_REFRESH_TOKEN:");
         console.log(refreshToken);
         console.log("---------------------------------");
-        
         res.send('¡Autorización completada con éxito! Ya puedes cerrar esta ventana y volver a WhatsApp.');
     } catch (error) {
         console.error("Error al obtener los tokens de Google:", error);
@@ -255,8 +297,5 @@ app.get('/oauth2callback', async (req, res) => {
     }
 });
 
-// --- INICIAR SERVIDOR ---
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Servidor escuchando en el puerto ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`Servidor escuchando en el puerto ${PORT}`); });
