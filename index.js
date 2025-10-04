@@ -169,7 +169,10 @@ async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const currentDate = new Date().toISOString();
     const messages = [
-        { role: "system", content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Resume la información y formatea tu respuesta de manera clara y amigable.` },
+        { 
+            role: "system", 
+            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Resume la información y formatea tu respuesta de manera clara y amigable.`
+        },
         { role: "user", content: texto }
     ];
 
@@ -201,7 +204,21 @@ async function procesarTextoConIA(texto, from) {
             
             console.log("🧠 4. Resultado de la herramienta:", functionResponse);
 
-            const contentString = JSON.stringify(functionResponse) || '{"status": "La herramienta no devolvió resultado"}';
+            // --- INICIO DE LA MEJORA: Resumir los resultados antes de continuar ---
+            let contentObject = functionResponse;
+            if (functionName === 'get_calendar_events' && Array.isArray(functionResponse)) {
+                // Si obtenemos una lista de eventos, la limpiamos para quedarnos solo con lo esencial.
+                contentObject = functionResponse.map(event => ({
+                    id: event.id,
+                    summary: event.summary,
+                    start: event.start.dateTime,
+                    end: event.end.dateTime
+                }));
+                console.log("🧠 4b. Resultado resumido para la IA:", contentObject);
+            }
+            // --- FIN DE LA MEJORA ---
+
+            const contentString = JSON.stringify(contentObject) || '{"status": "La herramienta no devolvió resultado"}';
             messages.push({
                 tool_call_id: toolCall.id,
                 role: "tool",
@@ -217,6 +234,7 @@ async function procesarTextoConIA(texto, from) {
         const finalMessage = finalResponse.choices[0].message.content;
         console.log("🧠 6. Respuesta final de la IA:", finalMessage);
         await enviarMensajeWhatsapp(finalMessage, from);
+
     } else {
         const simpleMessage = responseMessage.content;
         console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
