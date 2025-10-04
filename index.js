@@ -10,7 +10,7 @@ import path from 'path';
 const app = express();
 app.use(bodyParser.json());
 
-// --- VARIABLES DE ENTORNO ---
+// --- VARIABLES DE ENTORNO (sin cambios) ---
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
@@ -21,7 +21,7 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
 
-// --- CONFIGURACIÓN DE GOOGLE ---
+// --- CONFIGURACIÓN DE GOOGLE (sin cambios) ---
 const oauth2Client = new google.auth.OAuth2(
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
@@ -35,21 +35,14 @@ if (GOOGLE_REFRESH_TOKEN) {
 }
 const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI ---
+// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI (CON CAMBIOS) ---
 const tools = [
   {
     type: "function",
     function: {
       name: "get_calendar_events",
-      description: "Obtiene una lista de eventos del calendario de Google para un rango de fechas.",
-      parameters: {
-        type: "object",
-        properties: {
-          timeMin: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
-          timeMax: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
-        },
-        required: ["timeMin", "timeMax"],
-      },
+      description: "Obtiene una lista de eventos del calendario de Google para un rango de fechas. Es útil para encontrar eventos antes de modificarlos.",
+      parameters: { /* ... (sin cambios) ... */ },
     },
   },
   {
@@ -57,107 +50,55 @@ const tools = [
     function: {
       name: "create_calendar_event",
       description: "Crea un nuevo evento en el calendario de Google.",
-      parameters: {
-        type: "object",
-        properties: {
-          summary: { type: "string", description: "El título del evento." },
-          startDateTime: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
-          endDateTime: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
+      parameters: { /* ... (sin cambios) ... */ },
+    },
+  },
+  // --- NUEVA HERRAMIENTA AÑADIDA ---
+  {
+    type: "function",
+    function: {
+        name: "update_calendar_event",
+        description: "Modifica o mueve un evento existente en el calendario de Google. Necesita el ID del evento.",
+        parameters: {
+            type: "object",
+            properties: {
+                eventId: { type: "string", description: "El ID del evento a modificar. Se debe obtener primero buscando el evento." },
+                startDateTime: { type: "string", description: "La nueva fecha y hora de inicio en formato ISO 8601." },
+                endDateTime: { type: "string", description: "La nueva fecha y hora de fin en formato ISO 8601." },
+            },
+            required: ["eventId", "startDateTime", "endDateTime"],
         },
-        required: ["summary", "startDateTime", "endDateTime"],
-      },
     },
   },
 ];
 
-// --- FUNCIONES DE HERRAMIENTAS (LAS MANOS) ---
-async function getCalendarEvents(timeMin, timeMax) {
+
+// --- FUNCIONES DE HERRAMIENTAS (CON CAMBIOS) ---
+async function getCalendarEvents(timeMin, timeMax) { /* ... (sin cambios) ... */ }
+async function createCalendarEvent(summary, startDateTime, endDateTime) { /* ... (sin cambios) ... */ }
+
+// --- NUEVA FUNCIÓN AÑADIDA ---
+async function updateCalendarEvent(eventId, startDateTime, endDateTime) {
   try {
-    const calendarList = await calendar.calendarList.list();
-    const calendars = calendarList.data.items;
-
-    const eventPromises = calendars.map(cal => {
-        return calendar.events.list({
-            calendarId: cal.id,
-            timeMin,
-            timeMax,
-            maxResults: 50,
-            singleEvents: true,
-            orderBy: 'startTime',
-        });
-    });
-
-    const allEventResponses = await Promise.all(eventPromises);
-    let allEvents = [];
-    allEventResponses.forEach(response => {
-        if (response.data.items) {
-            allEvents = allEvents.concat(response.data.items);
-        }
-    });
-
-    allEvents.sort((a, b) => new Date(a.start.dateTime || a.start.date) - new Date(b.start.dateTime || b.start.date));
-
-    return allEvents.slice(0, 25);
-  } catch (error) {
-    console.error("Error al obtener eventos del calendario:", error);
-    return { error: "No se pudieron obtener los eventos." };
-  }
-}
-
-async function createCalendarEvent(summary, startDateTime, endDateTime) {
-  try {
-    const response = await calendar.events.insert({
+    const response = await calendar.events.patch({
       calendarId: 'primary',
+      eventId: eventId,
       requestBody: {
-        summary,
-        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' }, // Ajusta tu zona horaria si es necesario
+        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
         end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
       },
     });
     return response.data;
   } catch (error) {
-    console.error("Error al crear el evento:", error);
-    return { error: "No se pudo crear el evento." };
+    console.error(`Error al actualizar el evento ${eventId}:`, error);
+    return { error: "No se pudo actualizar el evento." };
   }
 }
 
-// --- FUNCIÓN DE TRANSCRIPCIÓN DE AUDIO (LOS OÍDOS) ---
-async function transcribeAudio(mediaId) {
-    try {
-        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, {
-            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-        });
-        const mediaUrl = mediaUrlResponse.data.url;
+// --- FUNCIÓN DE TRANSCRIPCIÓN DE AUDIO (sin cambios) ---
+async function transcribeAudio(mediaId) { /* ... (sin cambios) ... */ }
 
-        const audioResponse = await axios({
-            url: mediaUrl,
-            method: 'GET',
-            responseType: 'stream',
-            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-        });
-        
-        const tempPath = path.join('/tmp', `${mediaId}.ogg`);
-        const writer = fs.createWriteStream(tempPath);
-        audioResponse.data.pipe(writer);
-        await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
-
-        const transcription = await openai.audio.transcriptions.create({
-            file: fs.createReadStream(tempPath),
-            model: "whisper-1",
-        });
-
-        fs.unlinkSync(tempPath);
-        return transcription.text;
-    } catch (error) {
-        console.error("Error al transcribir el audio:", error.response ? error.response.data : error.message);
-        return { error: "No se pudo procesar el audio." };
-    }
-}
-
-// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (EL CEREBRO) ---
+// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (CON CAMBIOS) ---
 async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const currentDate = new Date().toISOString();
@@ -165,12 +106,9 @@ async function procesarTextoConIA(texto, from) {
     const messages = [
         { 
             role: "system", 
-            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando muestres eventos del calendario, resume la información: muestra solo el título y la hora. NUNCA incluyas descripciones largas, enlaces de Google Meet, o IDs de eventos a menos que el usuario te lo pida explícitamente. Formatea tu respuesta de manera clara y amigable.`
+            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Resume la información y formatea tu respuesta de manera clara y amigable.`
         },
-        { 
-            role: "user", 
-            content: texto 
-        }
+        { role: "user", content: texto }
     ];
 
     const response = await openai.chat.completions.create({
@@ -194,10 +132,13 @@ async function procesarTextoConIA(texto, from) {
 
             console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
 
+            // --- LÓGICA DE HERRAMIENTAS ACTUALIZADA ---
             if (functionName === "get_calendar_events") {
                 functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
             } else if (functionName === "create_calendar_event") {
                 functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
+            } else if (functionName === "update_calendar_event") {
+                functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime);
             }
             
             console.log("🧠 4. Resultado de la herramienta:", functionResponse);
