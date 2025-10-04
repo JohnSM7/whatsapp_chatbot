@@ -168,78 +168,82 @@ async function transcribeAudio(mediaId) {
 async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const currentDate = new Date().toISOString();
+    
+    // La conversación empieza con el contexto del sistema y el mensaje del usuario
     const messages = [
         { 
             role: "system", 
-            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Resume la información y formatea tu respuesta de manera clara y amigable.`
+            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Puedes llamar a múltiples herramientas si es necesario. Resume la información y formatea tu respuesta de manera clara y amigable.`
         },
         { role: "user", content: texto }
     ];
 
-    const response = await openai.chat.completions.create({
-        model: "gpt-4o", messages: messages, tools: tools, tool_choice: "auto",
-    });
-    
-    const responseMessage = response.choices[0].message;
-    const toolCalls = responseMessage.tool_calls;
+    // --- INICIO DEL NUEVO BUCLE DE CONVERSACIÓN ---
+    let maxTurns = 5; // Límite de seguridad para evitar bucles infinitos
+    while (maxTurns > 0) {
+        maxTurns--;
 
-    if (toolCalls) {
-        console.log("🧠 2a. La IA ha decidido usar una herramienta.");
-        messages.push(responseMessage);
-        
-        for (const toolCall of toolCalls) {
-            const functionName = toolCall.function.name;
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-            let functionResponse;
-
-            console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
-
-            if (functionName === "get_calendar_events") {
-                functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
-            } else if (functionName === "create_calendar_event") {
-                functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
-            } else if (functionName === "update_calendar_event") {
-                functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime);
-            }
-            
-            console.log("🧠 4. Resultado de la herramienta:", functionResponse);
-
-            // --- INICIO DE LA MEJORA: Resumir los resultados antes de continuar ---
-            let contentObject = functionResponse;
-            if (functionName === 'get_calendar_events' && Array.isArray(functionResponse)) {
-                // Si obtenemos una lista de eventos, la limpiamos para quedarnos solo con lo esencial.
-                contentObject = functionResponse.map(event => ({
-                    id: event.id,
-                    summary: event.summary,
-                    start: event.start.dateTime,
-                    end: event.end.dateTime
-                }));
-                console.log("🧠 4b. Resultado resumido para la IA:", contentObject);
-            }
-            // --- FIN DE LA MEJORA ---
-
-            const contentString = JSON.stringify(contentObject) || '{"status": "La herramienta no devolvió resultado"}';
-            messages.push({
-                tool_call_id: toolCall.id,
-                role: "tool",
-                name: functionName,
-                content: contentString,
-            });
-        }
-        
-        console.log("🧠 5. Enviando resultado a OpenAI para obtener respuesta final...");
-        const finalResponse = await openai.chat.completions.create({
-            model: "gpt-4o", messages: messages,
+        const response = await openai.chat.completions.create({
+            model: "gpt-4o", 
+            messages: messages, 
+            tools: tools, 
+            tool_choice: "auto",
         });
-        const finalMessage = finalResponse.choices[0].message.content;
-        console.log("🧠 6. Respuesta final de la IA:", finalMessage);
-        await enviarMensajeWhatsapp(finalMessage, from);
+        
+        const responseMessage = response.choices[0].message;
+        const toolCalls = responseMessage.tool_calls;
 
-    } else {
-        const simpleMessage = responseMessage.content;
-        console.log("🧠 2b. La IA ha respondido directamente:", simpleMessage);
-        await enviarMensajeWhatsapp(simpleMessage, from);
+        if (toolCalls) {
+            console.log("🧠 2a. La IA ha decidido usar una o más herramientas.");
+            messages.push(responseMessage); // Añadir la decisión de la IA al historial
+            
+            // Ejecutar cada herramienta que la IA solicitó
+            for (const toolCall of toolCalls) {
+                const functionName = toolCall.function.name;
+                const functionArgs = JSON.parse(toolCall.function.arguments);
+                let functionResponse;
+
+                console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
+
+                if (functionName === "get_calendar_events") {
+                    functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
+                } else if (functionName === "create_calendar_event") {
+                    functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
+                } else if (functionName === "update_calendar_event") {
+                    functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime);
+                }
+                
+                console.log("🧠 4. Resultado de la herramienta:", functionResponse);
+
+                let contentObject = functionResponse;
+                if (functionName === 'get_calendar_events' && Array.isArray(functionResponse)) {
+                    contentObject = functionResponse.map(event => ({ id: event.id, summary: event.summary, start: event.start.dateTime, end: event.end.dateTime }));
+                    console.log("🧠 4b. Resultado resumido para la IA:", contentObject);
+                }
+
+                const contentString = JSON.stringify(contentObject) || '{"status": "La herramienta no devolvió resultado"}';
+                
+                // Añadir el resultado de la herramienta al historial
+                messages.push({
+                    tool_call_id: toolCall.id,
+                    role: "tool",
+                    name: functionName,
+                    content: contentString,
+                });
+            }
+            // Continuar con la siguiente iteración del bucle para que la IA decida el siguiente paso
+            console.log("🧠 5. Volviendo a la IA con los resultados de las herramientas...");
+
+        } else {
+            // Si no hay más llamadas a herramientas, la IA ha terminado y da su respuesta final
+            const finalMessage = responseMessage.content;
+            console.log("🧠 6. Respuesta final de la IA:", finalMessage);
+            await enviarMensajeWhatsapp(finalMessage, from);
+            return; // Salir de la función
+        }
     }
+    // Si se alcanza el límite de turnos, enviar un mensaje de error
+    await enviarMensajeWhatsapp("Parece que la tarea es muy compleja y me he perdido. ¿Podemos intentarlo de nuevo de una forma más simple?", from);
 }
 
 // --- FUNCIÓN AUXILIAR PARA ENVIAR MENSAJES ---
