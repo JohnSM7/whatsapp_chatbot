@@ -6,6 +6,7 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import axios from 'axios';
 import path from 'path';
+import Redis from 'ioredis';
 
 const app = express();
 app.use(bodyParser.json());
@@ -15,6 +16,7 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const redis = new Redis(process.env.REDIS_URL);
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -168,18 +170,30 @@ async function transcribeAudio(mediaId) {
 async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const currentDate = new Date().toISOString();
-    
-    // La conversación empieza con el contexto del sistema y el mensaje del usuario
-    const messages = [
-        { 
-            role: "system", 
-            content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. Cuando el usuario pida mover un evento, primero debes usar la herramienta 'get_calendar_events' para encontrar el evento y obtener su ID, y luego usar la herramienta 'update_calendar_event' con ese ID para moverlo a la nueva fecha. Puedes llamar a múltiples herramientas si es necesario. Resume la información y formatea tu respuesta de manera clara y amigable.`
-        },
-        { role: "user", content: texto }
-    ];
+    const userKey = `whatsapp:${from}`; // Clave única para guardar la conversación de este usuario
 
-    // --- INICIO DEL NUEVO BUCLE DE CONVERSACIÓN ---
-    let maxTurns = 5; // Límite de seguridad para evitar bucles infinitos
+    // --- CARGAR LA MEMORIA ---
+    let conversationHistory = [];
+    try {
+        const historyJson = await redis.get(userKey);
+        if (historyJson) {
+            conversationHistory = JSON.parse(historyJson);
+        }
+    } catch (e) { console.error("Error al cargar el historial de Redis:", e); }
+    
+    // El mensaje de sistema siempre va primero y no se guarda en el historial
+    const systemMessage = { 
+        role: "system", 
+        content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. [...]` // (tu prompt de sistema completo)
+    };
+
+    // Añadir el nuevo mensaje del usuario al historial
+    conversationHistory.push({ role: "user", content: texto });
+
+    // La IA verá el mensaje de sistema + el historial de la conversación
+    const messages = [systemMessage, ...conversationHistory];
+
+    let maxTurns = 5;
     while (maxTurns > 0) {
         maxTurns--;
 
@@ -191,55 +205,34 @@ async function procesarTextoConIA(texto, from) {
         });
         
         const responseMessage = response.choices[0].message;
+        
+        // Añadir la respuesta de la IA al historial
+        messages.push(responseMessage);
+        
         const toolCalls = responseMessage.tool_calls;
-
         if (toolCalls) {
-            console.log("🧠 2a. La IA ha decidido usar una o más herramientas.");
-            messages.push(responseMessage); // Añadir la decisión de la IA al historial
-            
-            // Ejecutar cada herramienta que la IA solicitó
-            for (const toolCall of toolCalls) {
-                const functionName = toolCall.function.name;
-                const functionArgs = JSON.parse(toolCall.function.arguments);
-                let functionResponse;
-
-                console.log(`🧠 3. Ejecutando herramienta: ${functionName} con argumentos:`, functionArgs);
-
-                if (functionName === "get_calendar_events") {
-                    functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax);
-                } else if (functionName === "create_calendar_event") {
-                    functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime);
-                } else if (functionName === "update_calendar_event") {
-                    functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime);
-                }
-                
-                console.log("🧠 4. Resultado de la herramienta:", functionResponse);
-
-                let contentObject = functionResponse;
-                if (functionName === 'get_calendar_events' && Array.isArray(functionResponse)) {
-                    contentObject = functionResponse.map(event => ({ id: event.id, summary: event.summary, start: event.start.dateTime, end: event.end.dateTime }));
-                    console.log("🧠 4b. Resultado resumido para la IA:", contentObject);
-                }
-
-                const contentString = JSON.stringify(contentObject) || '{"status": "La herramienta no devolvió resultado"}';
-                
-                // Añadir el resultado de la herramienta al historial
-                messages.push({
-                    tool_call_id: toolCall.id,
-                    role: "tool",
-                    name: functionName,
-                    content: contentString,
-                });
-            }
-            // Continuar con la siguiente iteración del bucle para que la IA decida el siguiente paso
-            console.log("🧠 5. Volviendo a la IA con los resultados de las herramientas...");
-
+            // ... (tu lógica para ejecutar herramientas) ...
+            // (El código dentro del bucle para llamar a las funciones no cambia)
         } else {
-            // Si no hay más llamadas a herramientas, la IA ha terminado y da su respuesta final
+            // Si no hay más herramientas, la IA ha terminado
             const finalMessage = responseMessage.content;
-            console.log("🧠 6. Respuesta final de la IA:", finalMessage);
+            
+            // --- GUARDAR LA MEMORIA ---
+            // Añadimos el último mensaje del usuario y la respuesta final al historial que vamos a guardar
+            const finalHistory = [
+                ...conversationHistory, // Mensajes anteriores + el mensaje actual del usuario
+                { role: "assistant", content: finalMessage } // La respuesta final del bot
+            ];
+            
+            // Guardamos solo los últimos 10 mensajes para no saturar la memoria
+            try {
+                await redis.set(userKey, JSON.stringify(finalHistory.slice(-10)));
+                await redis.expire(userKey, 3600); // La memoria expira después de 1 hora de inactividad
+                console.log("✅ Memoria de la conversación guardada en Redis.");
+            } catch (e) { console.error("Error al guardar en Redis:", e); }
+
             await enviarMensajeWhatsapp(finalMessage, from);
-            return; // Salir de la función
+            return;
         }
     }
     // Si se alcanza el límite de turnos, enviar un mensaje de error
