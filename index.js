@@ -6,7 +6,7 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import axios from 'axios';
 import path from 'path';
-import Redis from 'ioredis';
+import pg from 'pg'; // <--- AÑADIDO: El "driver" para PostgreSQL
 
 const app = express();
 app.use(bodyParser.json());
@@ -16,12 +16,20 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const redis = new Redis(process.env.REDIS_URL);
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI;
 const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+const DATABASE_URL = process.env.DATABASE_URL; // <--- AÑADIDO: Railway lo inyecta solo
+
+// --- CONFIGURACIÓN DE POSTGRESQL ---
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false // Requerido para conexiones seguras a Railway
+  }
+});
 
 // --- CONFIGURACIÓN DE GOOGLE ---
 const oauth2Client = new google.auth.OAuth2(
@@ -35,209 +43,98 @@ if (GOOGLE_REFRESH_TOKEN) {
 }
 const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI ---
-const tools = [
-  {
-    type: "function",
-    function: {
-      name: "get_calendar_events",
-      description: "Obtiene una lista de eventos del calendario de Google para un rango de fechas. Es útil para encontrar eventos antes de modificarlos.",
-      parameters: {
-        type: "object",
-        properties: {
-          timeMin: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
-          timeMax: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
-        },
-        required: ["timeMin", "timeMax"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "create_calendar_event",
-      description: "Crea un nuevo evento en el calendario de Google.",
-      parameters: {
-        type: "object",
-        properties: {
-          summary: { type: "string", description: "El título del evento." },
-          startDateTime: { type: "string", description: "Fecha y hora de inicio en formato ISO 8601." },
-          endDateTime: { type: "string", description: "Fecha y hora de fin en formato ISO 8601." },
-        },
-        required: ["summary", "startDateTime", "endDateTime"],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-        name: "update_calendar_event",
-        description: "Modifica o mueve un evento existente en el calendario de Google. Necesita el ID del evento.",
-        parameters: {
-            type: "object",
-            properties: {
-                eventId: { type: "string", description: "El ID del evento a modificar. Se debe obtener primero buscando el evento." },
-                startDateTime: { type: "string", description: "La nueva fecha y hora de inicio en formato ISO 8601." },
-                endDateTime: { type: "string", description: "La nueva fecha y hora de fin en formato ISO 8601." },
-            },
-            required: ["eventId", "startDateTime", "endDateTime"],
-        },
-    },
-  },
-];
+// --- DEFINICIÓN DE HERRAMIENTAS PARA OPENAI (sin cambios) ---
+const tools = [ /* ... tu array de herramientas ... */ ];
 
-// --- FUNCIONES DE HERRAMIENTAS (LAS MANOS) ---
-async function getCalendarEvents(timeMin, timeMax) {
-  if (!timeMin || !timeMax) {
-      console.error("Error: La herramienta get_calendar_events fue llamada sin fechas.");
-      return [];
-  }
-  try {
-    const calendarList = await calendar.calendarList.list();
-    const calendars = calendarList.data.items;
-    const eventPromises = calendars.map(cal => {
-        return calendar.events.list({
-            calendarId: cal.id, timeMin, timeMax, maxResults: 50, singleEvents: true, orderBy: 'startTime',
-        });
-    });
-    const allEventResponses = await Promise.all(eventPromises);
-    let allEvents = [];
-    allEventResponses.forEach(response => {
-        if (response.data.items) { allEvents = allEvents.concat(response.data.items); }
-    });
-    allEvents.sort((a, b) => new Date(a.start.dateTime || a.start.date) - new Date(b.start.dateTime || b.start.date));
-    return allEvents.slice(0, 25);
-  } catch (error) {
-    console.error("Error al obtener eventos del calendario:", error);
-    return { error: "No se pudieron obtener los eventos." };
-  }
-}
+// --- FUNCIONES DE HERRAMIENTAS (sin cambios) ---
+async function getCalendarEvents(timeMin, timeMax) { /* ... tu código ... */ }
+async function createCalendarEvent(summary, startDateTime, endDateTime) { /* ... tu código ... */ }
+async function updateCalendarEvent(eventId, startDateTime, endDateTime) { /* ... tu código ... */ }
+async function transcribeAudio(mediaId) { /* ... tu código ... */ }
 
-async function createCalendarEvent(summary, startDateTime, endDateTime) {
-  try {
-    const response = await calendar.events.insert({
-      calendarId: 'primary',
-      requestBody: {
-        summary,
-        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
-        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
-      },
-    });
-    return response.data;
-  } catch (error) {
-    console.error("Error al crear el evento:", error);
-    return { error: "No se pudo crear el evento." };
-  }
-}
-
-async function updateCalendarEvent(eventId, startDateTime, endDateTime) {
-  try {
-    const response = await calendar.events.patch({
-      calendarId: 'primary',
-      eventId: eventId,
-      requestBody: {
-        start: { dateTime: startDateTime, timeZone: 'Europe/Madrid' },
-        end: { dateTime: endDateTime, timeZone: 'Europe/Madrid' },
-      },
-    });
-    return response.data;
-  } catch (error) {
-    console.error(`Error al actualizar el evento ${eventId}:`, error);
-    return { error: "No se pudo actualizar el evento." };
-  }
-}
-
-// --- FUNCIÓN DE TRANSCRIPCIÓN DE AUDIO (LOS OÍDOS) ---
-async function transcribeAudio(mediaId) {
-    try {
-        const mediaUrlResponse = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, { headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
-        const mediaUrl = mediaUrlResponse.data.url;
-        const audioResponse = await axios({ url: mediaUrl, method: 'GET', responseType: 'stream', headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` } });
-        const tempPath = path.join('/tmp', `${mediaId}.ogg`);
-        const writer = fs.createWriteStream(tempPath);
-        audioResponse.data.pipe(writer);
-        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-        const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(tempPath), model: "whisper-1" });
-        fs.unlinkSync(tempPath);
-        return transcription.text;
-    } catch (error) {
-        console.error("Error al transcribir el audio:", error.response ? error.response.data : error.message);
-        return { error: "No se pudo procesar el audio." };
-    }
-}
-
-// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (EL CEREBRO) ---
+// --- FUNCIÓN PRINCIPAL DE PROCESAMIENTO (MODIFICADA PARA USAR POSTGRESQL) ---
 async function procesarTextoConIA(texto, from) {
     console.log("🧠 1. Iniciando procesamiento con IA...");
     const currentDate = new Date().toISOString();
-    const userKey = `whatsapp:${from}`; // Clave única para guardar la conversación de este usuario
+    const userKey = from; // Usamos el número de WhatsApp como ID
 
-    // --- CARGAR LA MEMORIA ---
+    // --- CARGAR MEMORIA DESDE POSTGRESQL ---
     let conversationHistory = [];
     try {
-        const historyJson = await redis.get(userKey);
-        if (historyJson) {
-            conversationHistory = JSON.parse(historyJson);
-        }
-    } catch (e) { console.error("Error al cargar el historial de Redis:", e); }
+        const historyResult = await pool.query(
+            `SELECT role, content FROM messages WHERE user_id = $1 ORDER BY timestamp DESC LIMIT 10`,
+            [userKey]
+        );
+        conversationHistory = historyResult.rows.reverse(); // Invertir para orden cronológico
+        console.log("✅ Memoria de la conversación cargada desde PostgreSQL.");
+    } catch (e) { console.error("Error al cargar historial de PostgreSQL:", e); }
     
-    // El mensaje de sistema siempre va primero y no se guarda en el historial
     const systemMessage = { 
         role: "system", 
-        content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. Tu objetivo es ser extremadamente conciso y útil. [...]` // (tu prompt de sistema completo)
+        content: `Eres un asistente de WhatsApp llamado Oráculo. La fecha y hora actual es ${currentDate}. [...]` // Tu prompt de sistema completo
     };
 
-    // Añadir el nuevo mensaje del usuario al historial
-    conversationHistory.push({ role: "user", content: texto });
-
-    // La IA verá el mensaje de sistema + el historial de la conversación
-    const messages = [systemMessage, ...conversationHistory];
+    const messages = [
+        systemMessage,
+        ...conversationHistory,
+        { role: "user", content: texto }
+    ];
 
     let maxTurns = 5;
     while (maxTurns > 0) {
         maxTurns--;
 
         const response = await openai.chat.completions.create({
-            model: "gpt-4o", 
-            messages: messages, 
-            tools: tools, 
-            tool_choice: "auto",
+            model: "gpt-4o", messages: messages, tools: tools, tool_choice: "auto",
         });
         
         const responseMessage = response.choices[0].message;
-        
-        // Añadir la respuesta de la IA al historial
         messages.push(responseMessage);
         
         const toolCalls = responseMessage.tool_calls;
         if (toolCalls) {
-            // ... (tu lógica para ejecutar herramientas) ...
-            // (El código dentro del bucle para llamar a las funciones no cambia)
+            // ... (La lógica para ejecutar herramientas no cambia) ...
+            for (const toolCall of toolCalls) {
+                // ... tu código para ejecutar las herramientas ...
+                const functionName = toolCall.function.name;
+                const functionArgs = JSON.parse(toolCall.function.arguments);
+                let functionResponse;
+
+                if (functionName === "get_calendar_events") { functionResponse = await getCalendarEvents(functionArgs.timeMin, functionArgs.timeMax); } 
+                else if (functionName === "create_calendar_event") { functionResponse = await createCalendarEvent(functionArgs.summary, functionArgs.startDateTime, functionArgs.endDateTime); }
+                else if (functionName === "update_calendar_event") { functionResponse = await updateCalendarEvent(functionArgs.eventId, functionArgs.startDateTime, functionArgs.endDateTime); }
+                
+                let contentObject = functionResponse;
+                if (functionName === 'get_calendar_events' && Array.isArray(functionResponse)) {
+                    contentObject = functionResponse.map(event => ({ id: event.id, summary: event.summary, start: event.start.dateTime, end: event.end.dateTime }));
+                }
+
+                const contentString = JSON.stringify(contentObject) || '{"status": "La herramienta no devolvió resultado"}';
+                messages.push({ tool_call_id: toolCall.id, role: "tool", name: functionName, content: contentString });
+            }
+            console.log("🧠 5. Volviendo a la IA con los resultados...");
         } else {
-            // Si no hay más herramientas, la IA ha terminado
             const finalMessage = responseMessage.content;
             
-            // --- GUARDAR LA MEMORIA ---
-            // Añadimos el último mensaje del usuario y la respuesta final al historial que vamos a guardar
-            const finalHistory = [
-                ...conversationHistory, // Mensajes anteriores + el mensaje actual del usuario
-                { role: "assistant", content: finalMessage } // La respuesta final del bot
-            ];
-            
-            // Guardamos solo los últimos 10 mensajes para no saturar la memoria
+            // --- GUARDAR MEMORIA EN POSTGRESQL ---
             try {
-                await redis.set(userKey, JSON.stringify(finalHistory.slice(-10)));
-                await redis.expire(userKey, 3600); // La memoria expira después de 1 hora de inactividad
-                console.log("✅ Memoria de la conversación guardada en Redis.");
-            } catch (e) { console.error("Error al guardar en Redis:", e); }
+                // Guardamos el último mensaje del usuario
+                await pool.query(`INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)`, [userKey, 'user', texto]);
+                // Guardamos la respuesta final del asistente
+                await pool.query(`INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)`, [userKey, 'assistant', finalMessage]);
+                console.log("✅ Conversación guardada en PostgreSQL.");
+            } catch (e) { console.error("Error al guardar en PostgreSQL:", e); }
 
             await enviarMensajeWhatsapp(finalMessage, from);
             return;
         }
     }
-    // Si se alcanza el límite de turnos, enviar un mensaje de error
-    await enviarMensajeWhatsapp("Parece que la tarea es muy compleja y me he perdido. ¿Podemos intentarlo de nuevo de una forma más simple?", from);
+    await enviarMensajeWhatsapp("Parece que la tarea es muy compleja y me he perdido. ¿Podemos intentarlo de nuevo?", from);
 }
+
+// --- RESTO DEL ARCHIVO (SIN CAMBIOS) ---
+// Aquí van todas tus otras funciones: enviarMensajeWhatsapp, endpoints, app.listen, etc.
+// Asegúrate de que estén todas las funciones que usabas antes.
 
 // --- FUNCIÓN AUXILIAR PARA ENVIAR MENSAJES ---
 async function enviarMensajeWhatsapp(texto, numeroDestinatario) {
